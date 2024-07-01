@@ -3,7 +3,7 @@ import re
 from tkinter import filedialog, messagebox, ttk
 import sv_ttk  # Importar el tema sv_ttk
 import os
-from bancos import get_codigos_bancos,get_bancos
+from bancos import get_codigos_bancos, get_bancos
 import pandas as pd  # Importar pandas para manejar archivos CSV y Excel
 import pdfplumber  # Para manejo de archivos PDF
 
@@ -70,8 +70,12 @@ def convertir_extracto():
     # Aquí llamamos a la función que procesa el PDF
     df = extract_data_from_pdf(pdf_path, pages)
 
+    # Rellenar los NaN de la columna 'Crédito' con 0
+    df['Crédito'] = df['Crédito'].fillna(0)
+    df['Crédito'] = df['Crédito'].astype(float) # Convertir 'Crédito' a float
+
     # Cargar códigos de banco
-    codigos_banco = get_codigos_bancos().get(banco, [])
+    codigos_banco = get_codigos_bancos().get(banco, {"no_similares": [], "similares": []})
 
     # Función para limpiar códigos de banco y conceptos
     def limpiar_texto(texto):
@@ -79,15 +83,44 @@ def convertir_extracto():
         return re.sub(r'\.| ', '', texto.lower())
 
     # DataFrame para las hojas del Excel
-    df_hojas = {codigo: pd.DataFrame(columns=df.columns) for codigo in codigos_banco}
+    df_hojas = {}
 
-    # Iterar sobre el DataFrame y filtrar por códigos de banco
-    for codigo in codigos_banco:
+    # Iterar sobre los códigos no similares
+    for codigo in codigos_banco["no_similares"]:
         codigo_limpiado = limpiar_texto(codigo)
         mask = df['Concepto'].str.lower().apply(limpiar_texto).str.contains(codigo_limpiado)
         df_filtered = df[mask]
-        df_hojas[codigo] = pd.concat([df_hojas[codigo], df_filtered], ignore_index=True)
+        nombre_hoja = f"Mayor {codigo}"
+        df_hojas[nombre_hoja] = pd.concat([df_hojas.get(nombre_hoja, pd.DataFrame(columns=df.columns)), df_filtered],
+                                          ignore_index=True)
         df = df[~mask]  # Eliminar las filas filtradas del DataFrame original
+
+        # Iterar sobre los conjuntos de códigos similares
+    for idx, conjunto_similares in enumerate(codigos_banco["similares"], start=1):
+        nombre_hoja_similares = f"Mayor " + max(conjunto_similares, key=len)
+        for codigo_similar in conjunto_similares:
+            df_hojas[nombre_hoja_similares] = pd.concat(
+                [df_hojas.get(nombre_hoja_similares, pd.DataFrame(columns=df.columns)),
+                 df[df['Concepto'].str.lower().apply(limpiar_texto).str.contains(
+                     limpiar_texto(codigo_similar.lower()))]], ignore_index=True)
+            df = df[
+                ~df['Concepto'].str.lower().apply(limpiar_texto).str.contains(limpiar_texto(codigo_similar.lower()))]
+
+    df_emitidos_matched = pd.DataFrame()  # DataFrame para guardar las coincidencias
+
+    if df_emitidos_global is not None:
+        df_emitidos = df_emitidos_global
+
+        # Ajustar valores en df['Crédito'] a dos decimales y coma
+        df['Crédito'] = df['Crédito'].apply(lambda x: f"{x:.2f}".replace('.', ','))
+
+        # Buscar coincidencias y guardar en la hoja 'Coincidencias'
+        for index, row in df_emitidos.iterrows():
+            credit_value = row['Imp. Total']
+            if credit_value in df['Crédito'].values:
+                df_temp = df[df['Crédito'] == credit_value]  # Almacenar las filas coincidentes
+                df_emitidos_matched = pd.concat([df_emitidos_matched, df_temp])
+                df = df[df['Crédito'] != credit_value]  # Eliminar las filas coincidentes de df
 
     # Seleccionar la ruta y el nombre del archivo Excel
     output_file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
@@ -99,11 +132,21 @@ def convertir_extracto():
                 df_original = extract_data_from_pdf(pdf_path, pages)
                 df_original.to_excel(writer, sheet_name='Extracto Original', index=False)
 
-                # Guardar Extracto modif con el extracto original
+                # Guardar Extracto modificado con 'Crédito' como valores numéricos
+                df['Crédito'] = df['Crédito'].str.replace(',', '.').astype(float).round(2)
+                # Guardar Extracto modificado
                 df.to_excel(writer, sheet_name='Extracto modif', index=False)
 
-                # Guardar Hojas adicionales por cada código de banco
-                for codigo, df_hoja in df_hojas.items():
+                if not df_emitidos_matched.empty:
+                    # Eliminar columna 'Saldo' si existe en Coincidencias Emitidos
+                    if 'Saldo' in df_emitidos_matched.columns:
+                        df_emitidos_matched.drop(columns=['Saldo'], inplace=True)
+                    # Guardar Extracto modificado con 'Crédito' como valores numéricos
+                    df_emitidos_matched['Crédito'] = df_emitidos_matched['Crédito'].str.replace(',', '.').astype(float).round(2)
+                    df_emitidos_matched.to_excel(writer, sheet_name='Coincidencias Emitidos', index=False)
+
+                # Guardar Hojas adicionales por cada hoja de DataFrame
+                for nombre_hoja, df_hoja in df_hojas.items():
                     # Eliminar columna 'Saldo' si existe
                     if 'Saldo' in df_hoja.columns:
                         df_hoja.drop(columns=['Saldo'], inplace=True)
@@ -114,7 +157,7 @@ def convertir_extracto():
                     total_row = pd.DataFrame(
                         {'Concepto': ['TOTAL'], 'Débito': [suma_debito], 'Crédito': [suma_credito]})
                     df_hoja = pd.concat([df_hoja, total_row], ignore_index=True)
-                    df_hoja.to_excel(writer, sheet_name='Mayor ' + str(codigo), index=False)
+                    df_hoja.to_excel(writer, sheet_name=f'{nombre_hoja}', index=False)
 
                 messagebox.showinfo("Éxito", f"Archivo Excel creado con éxito: {output_file}")
         except Exception as e:
@@ -123,23 +166,18 @@ def convertir_extracto():
 
 # Función para cargar archivo comprobantes emitidos CSV o Excel
 def cargar_emitidos():
+    global df_emitidos_global
     file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv"),
                                                       ("Excel files", "*.xlsx;*.xls;*.xlsm")])
     if file_path:
         comprobante_emitidos_entry.delete(0, tk.END)  # Limpiar entrada anterior si hay
         comprobante_emitidos_entry.insert(0, file_path)
-        # Aquí puedes procesar el archivo CSV o Excel según sea necesario
         try:
-            if file_path.endswith(".csv"):
-                df = pd.read_csv(file_path)
-                # Procesar el DataFrame de CSV (ejemplo)
-                messagebox.showinfo("Éxito", f"Archivo CSV cargado correctamente")
-            elif file_path.endswith((".xlsx", ".xls", ".xlsm")):
-                df = pd.read_excel(file_path)
-                # Procesar el DataFrame de Excel (ejemplo)
-                messagebox.showinfo("Éxito", f"Archivo Excel cargado correctamente")
+            df_emitidos = pd.read_csv(file_path, sep=";")
+            df_emitidos_global = df_emitidos
         except Exception as e:
             messagebox.showerror("Error", f"Error al cargar el archivo: {e}")
+
 
 # Función para cargar archivo comprobantes recibidos CSV o Excel
 def cargar_recibidos():
@@ -210,23 +248,25 @@ end_page_var = tk.StringVar()
 end_page_entry = tk.Entry(root, textvariable=end_page_var, width=10, font=("Helvetica", 12))
 end_page_entry.grid(row=5, column=1, padx=10, pady=10)
 
-# Botón para convertir extracto
-convertir_button = tk.Button(root, text="Convertir extracto", command=convertir_extracto, font=("Helvetica", 12))
-convertir_button.grid(row=6, column=0, columnspan=3, pady=20)
-
 # Campo para cargar comprobantes emitidos
-tk.Label(root, text="Cargar comprobantes emitidos:", font=("Helvetica", 12)).grid(row=7, column=0, padx=10, pady=10)
+tk.Label(root, text="Cargar comprobantes emitidos:", font=("Helvetica", 12)).grid(row=6, column=0, padx=10, pady=10)
 comprobante_emitidos_entry = tk.Entry(root, width=50, font=("Helvetica", 12))
-comprobante_emitidos_entry.grid(row=7, column=1, padx=10, pady=10)
-cargar_comprobante_emitidos_button = tk.Button(root, text="Cargar emitidos", command=cargar_emitidos, font=("Helvetica", 12))
-cargar_comprobante_emitidos_button.grid(row=7, column=2, padx=10, pady=10)
+comprobante_emitidos_entry.grid(row=6, column=1, padx=10, pady=10)
+cargar_comprobante_emitidos_button = tk.Button(root, text="Cargar emitidos", command=cargar_emitidos,
+                                               font=("Helvetica", 12))
+cargar_comprobante_emitidos_button.grid(row=6, column=2, padx=10, pady=10)
 
 # Campo para cargar comprobantes recibidos
-tk.Label(root, text="Cargar comprobantes recibidos:", font=("Helvetica", 12)).grid(row=8, column=0, padx=10, pady=10)
+tk.Label(root, text="Cargar comprobantes recibidos:", font=("Helvetica", 12)).grid(row=7, column=0, padx=10, pady=10)
 comprobante_recibidos_entry = tk.Entry(root, width=50, font=("Helvetica", 12))
-comprobante_recibidos_entry.grid(row=8, column=1, padx=10, pady=10)
-cargar_comprobante_recibidos_button = tk.Button(root, text="Cargar recibidos", command=cargar_recibidos, font=("Helvetica", 12))
-cargar_comprobante_recibidos_button.grid(row=8, column=2, padx=10, pady=10)
+comprobante_recibidos_entry.grid(row=7, column=1, padx=10, pady=10)
+cargar_comprobante_recibidos_button = tk.Button(root, text="Cargar recibidos", command=cargar_recibidos,
+                                                font=("Helvetica", 12))
+cargar_comprobante_recibidos_button.grid(row=7, column=2, padx=10, pady=10)
+
+# Botón para convertir extracto
+convertir_button = tk.Button(root, text="Convertir extracto", command=convertir_extracto, font=("Helvetica", 12))
+convertir_button.grid(row=8, column=0, columnspan=3, pady=20)
 
 # Aplicar colores y efectos a los botones
 button_bg = "#1E90FF"  # Dodger Blue
@@ -243,7 +283,8 @@ def on_leave(e, button):
     button['foreground'] = button_fg
 
 
-for button in [cargar_button, convertir_button, cargar_comprobante_emitidos_button, cargar_comprobante_recibidos_button]:
+for button in [cargar_button, convertir_button, cargar_comprobante_emitidos_button,
+               cargar_comprobante_recibidos_button]:
     button.configure(bg=button_bg, fg=button_fg, activebackground=button_fg, activeforeground=button_bg)
     button.bind("<Enter>", lambda e, b=button: on_enter(e, b))
     button.bind("<Leave>", lambda e, b=button: on_leave(e, b))
